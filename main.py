@@ -1,76 +1,125 @@
-#Motion Detection using Frame Differencing
+#Object Tracker
 
 import cv2
+import numpy as np
 
-class MotionTacker:
-    #__init__ is a special method of the class
+class ObjectTracker:
+    #A special method of the class.
     #It is auto invoked as object of the class is created.
-    #Its purpose is to initialize the object to first state.
+    #It initializes the object to first (initial) state.
+
     def __init__(self, src=0):
-        #Open/Access video source (file/camera)
-        self.vh = cv2.VideoCapture(src)
-        #Test the status
-        if not self.vh.isOpened():
-            raise Exception('Video Source Not Accessible')
+        #Capture the video source
+        self.video_handle = cv2.VideoCapture(src)
+        #Test the open status
+        if not self.video_handle.isOpened():
+            raise Exception('Cant Access : '+ src )
 
-        #define 3 frames
-        self.prev_frame = None
-        self.curr_frame = None
-        self.next_frame = None
+        #A frame to initialize from the video source and process too
+        self.frame = None
 
-    #motion detection
-    def frame_difference(self):
-        #d1 = abs(f1-f2)
-        d1 = cv2.absdiff(self.prev_frame, self.curr_frame)
-        #d2 = abs(f2-f3)
-        d2 = cv2.absdiff(self.curr_frame, self.next_frame)
-        #diff = d1 & d2
-        diff = cv2.bitwise_and(d1, d2)
-        return diff
+        #A flag to indicate the selection state of the ROI
+        self.selection_state = 0
+        self.selection = []
 
-    def track(self):
-        #create 2 windows
-        cv2.namedWindow('Video Player')
-        cv2.namedWindow('Motion')
+    def on_mouse_event(self, event, x, y, flag, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.selection.clear() # reset the selection
+            self.selection.append(x) #x of mouse down
+            self.selection.append(y) #y of mouse down
+            self.selection_state = 1
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.selection.append(x)  # x of mouse up
+            self.selection.append(y)  # y of mouse up
+            self.selection_state = 2
+
+        if self.selection_state ==2:
+            #x,y of mouse down and x,y of mouse up are captured
+            #normalize the users rectangle forming orientation in a manner that x1,y1 are top,left and x2,y2 are bottom,right
+            if self.selection[0] > self.selection[2]:
+                self.selection[0], self.selection[2] = self.selection[2], self.selection[0]
+            if self.selection[1] > self.selection[3]:
+                self.selection[1], self.selection[3] = self.selection[3], self.selection[1]
+
+            #correct x1 if it has become negative (selection ends outside the window)
+            self.selection[0] = 0 if self.selection[0] < 0 else self.selection[0]
+            # correct y1 if it has become negative (selection ends outside the window)
+            self.selection[1] = 0 if self.selection[1] < 0 else self.selection[1]
+            # correct x2 if it has become greater than width (selection ends outside the window)
+            self.selection[2] = self.frame.shape[1] if self.selection[2] > self.frame.shape[1] else self.selection[2]
+            # correct y2 if it has become greater than height (selection ends outside the window)
+            self.selection[3] = self.frame.shape[0] if self.selection[3] > self.frame.shape[0] else self.selection[3]
+
+            self.selection_state = 3
+
+    def play_and_track(self):
+        #Create named windows
+        cv2.namedWindow('Object Tracker')
+        #cv2.namedWindow('ROI')
+
+        #Register with CV2 for a callback on mouse event
+        cv2.setMouseCallback('Object Tracker', self.on_mouse_event )
 
         #know the FPS
-        fps = self.vh.get(cv2.CAP_PROP_FPS)
-
-        # read a video frame
-        # and fetch a tuple (boolean, ndarray)
-        # boolean indicates: read success or failure
-        # ndarray: is a frame
-
-        #initialize 3 frames
-        _, self.prev_frame = self.vh.read()
-        _, self.curr_frame = self.vh.read()
-        flag, self.next_frame = self.vh.read()
-
+        fps = self.video_handle.get(cv2.CAP_PROP_FPS)
+        print(fps)
+        #read the first frame
+        flag, self.frame = self.video_handle.read() #(boolean, ndarray)
         while flag:
-            #render the frame
-            cv2.imshow('Video Player', self.curr_frame)
-            #render the motion
-            cv2.imshow('Motion', self.frame_difference())
+            print(self.selection_state)
+            #As processing is to be done on HUE channel, so lets convert the frame from BGR to HSV
+            hsv_frame = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
 
-            #delay + read key pressed; if ESC then stop the loop
-            if cv2.waitKey(int(1/fps*1000)) == 27:
+            if self.selection_state == 3:
+                #cv2.rectangle(self.frame, (self.selection[0], self.selection[1]), (self.selection[2], self.selection[3]), (0,127,255), 1)
+                roi = hsv_frame[self.selection[1]:self.selection[3], self.selection[0]:self.selection[2]]
+                cv2.imshow('ROI', roi)
+                #histogram (of HUE channel only)
+                #calcHist([images], [channels], mask, [intervals], [ranges])
+                hist_roi = cv2.calcHist([roi],[0], None, [180], [0,179])
+
+                #Define initial tracker window for CAMShift
+                tracker_window = [self.selection[0], self.selection[1], self.selection[2] - self.selection[0], self.selection[3] - self.selection[1]] #left(x1),top(y1),width(x2-x1),height (y2-y1)
+
+                #Set termination criteria for CAMShift to: 10 iterations or max movement of 1 pixel
+                termination_criteria = (cv2.TermCriteria_COUNT | cv2.TermCriteria_EPS, 10,1)
+
+                self.selection_state = 4
+
+            if self.selection_state == 4:
+                #backprojection
+                #calcBackProject([images], [channels], histogram, [ranges], scale)
+                backprojection = cv2.calcBackProject([hsv_frame],[0], hist_roi,[0,179], 1 )
+
+                #Here we create a mask from the source image, by dropping out the weakly pronounced colors
+                mask = cv2.inRange(hsv_frame,np.array((0,60,30)), np.array((180, 255, 230)))
+                backprojection = backprojection & mask
+
+                cv2.imshow('BackProjection', backprojection)
+
+                #CAMShift
+                ellipse_params, tracker_window = cv2.CamShift(backprojection, tracker_window, termination_criteria)
+                #Draw an ellipse on original image
+
+                cv2.ellipse(self.frame, ellipse_params, color=(0,0,255), thickness=2)
+
+            #render
+            cv2.imshow('Object Tracker', self.frame)
+            #delay to match the FPS
+            if cv2.waitKey(int(1000/fps)) == 27: #ASCII(ESC) == 27
                 break
+            #next frame
+            flag, self.frame = self.video_handle.read()
 
-            #reinitialization
-            self.prev_frame = self.curr_frame
-            self.curr_frame = self.next_frame
-            flag, self.next_frame = self.vh.read()
-
-
-    #__del__ is a special method of the class
-    #It is auto invoked as object of the class is about to be deallocated.
-    #Its purpose is to free the resources used by the object.
-    def __del__(self):
-        print('in del')
+        #Destroy all windows
         cv2.destroyAllWindows()
-        if self.vh.isOpened():
-            self.vh.release()
 
+    #A special method of the class
+    #It gets auto invoked (by the Garbage Collector) as life of the object ends (When reference count reduces to 0 or when application ends) .
+    def __del__(self):
+        if self.video_handle.isOpened():
+            self.video_handle.release()
 
-mt = MotionTacker('D:/python/ObjectTracking/birds.mp4')
-mt.track()
+ot = ObjectTracker(0)
+ot.play_and_track()
